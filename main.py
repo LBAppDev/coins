@@ -24,14 +24,38 @@ def load_local_env(path: str = ".env") -> None:
 
 load_local_env()
 
+def normalize_secret(value: str | None) -> str:
+    if value is None:
+        return ""
+    cleaned = value.strip()
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in ("'", '"'):
+        cleaned = cleaned[1:-1].strip()
+    return cleaned
+
+def get_token_candidates() -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = []
+
+    primary = normalize_secret(os.getenv("DISCORD_USER_TOKEN"))
+    if primary:
+        candidates.append(("DISCORD_USER_TOKEN", primary))
+
+    for key, raw_value in os.environ.items():
+        if key == "DISCORD_USER_TOKEN" or not key.endswith("_DISCORD_USER_TOKEN"):
+            continue
+        candidate = normalize_secret(raw_value)
+        if candidate and all(candidate != existing for _, existing in candidates):
+            candidates.append((key, candidate))
+
+    return candidates
+
 # -------------------------------
 # Configuration
 # -------------------------------
-TOKEN = os.getenv("DISCORD_USER_TOKEN")
-if TOKEN:
-    TOKEN = TOKEN.strip()
-else:
-    raise RuntimeError("Missing DISCORD_USER_TOKEN in environment or .env")
+token_candidates = get_token_candidates()
+if not token_candidates:
+    raise RuntimeError("Missing DISCORD_USER_TOKEN (or *_DISCORD_USER_TOKEN) in environment or .env")
+
+TOKEN = ""
 
 channel_id_raw = os.getenv("TARGET_CHANNEL_ID")
 if not channel_id_raw:
@@ -50,18 +74,33 @@ print(TARGET_BOT_ID)
 # Optional token validation
 # -------------------------------
 print("Validating token...")
-headers = {"Authorization": TOKEN}
-try:
-    r = requests.get("https://discord.com/api/v9/users/@me", headers=headers, timeout=10)
+
+selected_source = None
+for source_name, candidate in token_candidates:
+    try:
+        r = requests.get(
+            "https://discord.com/api/v9/users/@me",
+            headers={"Authorization": candidate},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"Could not validate token from {source_name}: {e}")
+        continue
+
     if r.status_code == 200:
         user_data = r.json()
-        print(f"Token valid! Logged in as {user_data['username']}#{user_data['discriminator']}")
-    else:
-        print(f"Token validation failed (status {r.status_code}).")
-        print(f"Response: {r.text[:200]}")
-        sys.exit(1)
-except Exception as e:
-    print(f"Could not validate token: {e}")
+        TOKEN = candidate
+        selected_source = source_name
+        print(
+            f"Token valid from {source_name}! "
+            f"Logged in as {user_data['username']}#{user_data['discriminator']}"
+        )
+        break
+
+    print(f"Token in {source_name} failed (status {r.status_code}). Response: {r.text[:200]}")
+
+if not TOKEN:
+    print("No valid token found in configured token environment variables.")
     sys.exit(1)
 
 # -------------------------------
