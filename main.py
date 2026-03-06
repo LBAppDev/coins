@@ -282,6 +282,13 @@ async def send_message_loop():
                         return child
             return None
 
+        async def select_dropdown_option(select_menu: discord.SelectMenu, option: discord.SelectOption):
+            if hasattr(select_menu, "choose"):
+                return await select_menu.choose(option)
+            if hasattr(select_menu, "select"):
+                return await select_menu.select(values=[option.value])
+            raise RuntimeError("Select menu has no supported choose/select method")
+
         anti_rob_selected = False
         attempt = 0
         total_seen = 0
@@ -350,7 +357,7 @@ async def send_message_loop():
                     continue
 
                 try:
-                    await select_menu.choose(anti_rob_option)
+                    await select_dropdown_option(select_menu, anti_rob_option)
                     print(
                         f"[loop] Selected anti-rob (attempt {attempt}, "
                         f"label='{anti_rob_option.label}', value='{anti_rob_option.value}')"

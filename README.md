@@ -1,7 +1,7 @@
 # coins automation
 
 ## Requirements
-- Python 3.12+
+- Python 3.11+
 - A Discord user token and target channel access
 
 ## Local setup
