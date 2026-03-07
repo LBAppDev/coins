@@ -21,11 +21,11 @@
 - `BUY_MONITOR_SECONDS` (optional, default: `20`)
 
 ## Deploy on Koyeb
-Use a **Worker** service (not web), since this app does not expose HTTP.
+This app now exposes a simple health endpoint on `0.0.0.0:$PORT` (`/` returns `ok`), so it can run as a Web service.
 
 1. Push this repository to GitHub.
 2. In Koyeb, create a new service from your GitHub repo.
-3. Choose **Worker** type.
+3. Choose **Web** type (or Worker if you prefer).
 4. Build method:
    - Dockerfile (uses the included `Dockerfile`), or
    - Buildpacks (the included `Procfile` defines `worker: python main.py`)

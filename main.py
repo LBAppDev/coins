@@ -2,6 +2,8 @@
 import sys
 import warnings
 import asyncio
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from discord.ext import tasks, commands
 import discord
 import requests
@@ -124,6 +126,36 @@ if intents is not None:
 
 bot = commands.Bot(**bot_kwargs)
 console_task: asyncio.Task | None = None
+health_server: ThreadingHTTPServer | None = None
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"ok\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+def start_health_server() -> ThreadingHTTPServer:
+    port_raw = os.getenv("PORT", "8000").strip()
+    try:
+        port = int(port_raw)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid PORT value '{port_raw}'") from exc
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True, name="health-server")
+    thread.start()
+    print(f"[startup] Health server listening on 0.0.0.0:{port}")
+    return server
 
 def summarize_message_for_log(message: discord.Message, max_len: int = 280) -> str:
     parts: list[str] = []
@@ -484,4 +516,5 @@ async def on_command_error(ctx, error):
 # Run the bot
 # -------------------------------
 if __name__ == "__main__":
+    health_server = start_health_server()
     bot.run(TOKEN)
