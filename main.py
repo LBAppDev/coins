@@ -106,15 +106,23 @@ if not TOKEN:
 # -------------------------------
 # Bot setup
 # -------------------------------
-intents = discord.Intents.default()
-intents.message_content = True
+intents = None
+if hasattr(discord, "Intents"):
+    intents = discord.Intents.default()
+    if hasattr(intents, "message_content"):
+        intents.message_content = True
+else:
+    print("[startup] discord.Intents is unavailable in this discord package; continuing without intents.")
 
-bot = commands.Bot(
-    command_prefix="!",
-    self_bot=True,
-    intents=intents,
-    help_command=None,
-)
+bot_kwargs = {
+    "command_prefix": "!",
+    "self_bot": True,
+    "help_command": None,
+}
+if intents is not None:
+    bot_kwargs["intents"] = intents
+
+bot = commands.Bot(**bot_kwargs)
 console_task: asyncio.Task | None = None
 
 def summarize_message_for_log(message: discord.Message, max_len: int = 280) -> str:
