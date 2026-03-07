@@ -2,8 +2,6 @@
 import sys
 import warnings
 import asyncio
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from discord.ext import tasks, commands
 import discord
 import requests
@@ -67,10 +65,18 @@ try:
 except ValueError:
     raise RuntimeError("TARGET_CHANNEL_ID must be an integer")
 
+temp_voice_creator_raw = os.getenv("TEMP_VOICE_CREATOR_CHANNEL_ID", "1479600922727547043")
+try:
+    TEMP_VOICE_CREATOR_CHANNEL_ID = int(temp_voice_creator_raw.strip())
+except ValueError:
+    raise RuntimeError("TEMP_VOICE_CREATOR_CHANNEL_ID must be an integer")
+
 AUTO_MESSAGE = os.getenv("AUTO_MESSAGE", "Automated test message every 3 hours!")
 TARGET_BOT_ID = os.getenv("TARGET_BOT_ID")
 AUTO_MESSAGE_DELAY_SECONDS = float(os.getenv("AUTO_MESSAGE_DELAY_SECONDS", "2.0"))
 BUY_MONITOR_SECONDS = float(os.getenv("BUY_MONITOR_SECONDS", "20"))
+VOICE_MOVE_WAIT_SECONDS = float(os.getenv("VOICE_MOVE_WAIT_SECONDS", "5"))
+VOICE_MOVE_TIMEOUT_SECONDS = float(os.getenv("VOICE_MOVE_TIMEOUT_SECONDS", "45"))
 print(TARGET_BOT_ID)
 # -------------------------------
 # Optional token validation
@@ -126,36 +132,6 @@ if intents is not None:
 
 bot = commands.Bot(**bot_kwargs)
 console_task: asyncio.Task | None = None
-health_server: ThreadingHTTPServer | None = None
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        body = b"ok\n"
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
-
-    def log_message(self, format, *args):
-        return
-
-def start_health_server() -> ThreadingHTTPServer:
-    port_raw = os.getenv("PORT", "8000").strip()
-    try:
-        port = int(port_raw)
-    except ValueError as exc:
-        raise RuntimeError(f"Invalid PORT value '{port_raw}'") from exc
-
-    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True, name="health-server")
-    thread.start()
-    print(f"[startup] Health server listening on 0.0.0.0:{port}")
-    return server
 
 def summarize_message_for_log(message: discord.Message, max_len: int = 280) -> str:
     parts: list[str] = []
@@ -299,22 +275,104 @@ async def console_command_loop():
 
         print("[console] Unknown command. Use: msg <message> | join <invite>")
 
+async def connect_and_get_moved_voice_channel() -> tuple[discord.abc.Messageable | None, discord.VoiceClient | None, discord.Guild | None]:
+    temp_channel = bot.get_channel(TEMP_VOICE_CREATOR_CHANNEL_ID)
+    if temp_channel is None:
+        try:
+            temp_channel = await bot.fetch_channel(TEMP_VOICE_CREATOR_CHANNEL_ID)
+        except Exception as e:
+            print(f"[loop] Could not fetch temp voice creator channel {TEMP_VOICE_CREATOR_CHANNEL_ID}: {e}")
+            return None, None, None
+
+    if not hasattr(temp_channel, "guild") or not hasattr(temp_channel, "id"):
+        print(
+            f"[loop] Channel {TEMP_VOICE_CREATOR_CHANNEL_ID} is not a guild voice-like channel "
+            f"(type={type(temp_channel).__name__})"
+        )
+        return None, None, None
+
+    guild = temp_channel.guild
+    if guild is None or bot.user is None:
+        print("[loop] Missing guild/user context for voice move flow")
+        return None, None, None
+
+    if bot.voice_clients:
+        for existing_vc in list(bot.voice_clients):
+            try:
+                await existing_vc.disconnect(force=True)
+            except Exception as disconnect_error:
+                print(f"[loop] Failed disconnecting existing voice client: {disconnect_error}")
+
+    try:
+        # Use voice state updates instead of opening a voice websocket handshake (DAVE/E2EE can break connect()).
+        await guild.change_voice_state(channel=temp_channel, self_deaf=True, self_mute=False)
+    except Exception as connect_error:
+        print(f"[loop] Failed setting voice state to temp voice creator channel: {connect_error}")
+        return None, None, guild
+
+    print(f"[loop] Requested voice join to temp voice creator channel {temp_channel.id}")
+
+    moved_channel = None
+
+    def moved_check(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState) -> bool:
+        if bot.user is None or member.id != bot.user.id:
+            return False
+        if after.channel is None:
+            return False
+        return after.channel.id != temp_channel.id
+
+    try:
+        _, _, after_state = await bot.wait_for(
+            "voice_state_update",
+            timeout=VOICE_MOVE_TIMEOUT_SECONDS,
+            check=moved_check,
+        )
+        moved_channel = after_state.channel
+    except asyncio.TimeoutError:
+        # Fallback: check cached voice state map in case event was missed.
+        voice_state = guild.voice_states.get(bot.user.id)
+        if voice_state and voice_state.channel and voice_state.channel.id != temp_channel.id:
+            moved_channel = voice_state.channel
+    except Exception as move_wait_error:
+        print(f"[loop] Error while waiting for voice move event: {move_wait_error}")
+
+    if moved_channel is None:
+        print("[loop] Timed out waiting to be moved to a private voice channel")
+        return None, None, guild
+
+    print(f"[loop] Moved to private voice channel {moved_channel.id}")
+    await asyncio.sleep(VOICE_MOVE_WAIT_SECONDS)
+    if hasattr(moved_channel, "send"):
+        return moved_channel, None, guild
+
+    print(
+        f"[loop] Moved channel {moved_channel.id} is not messageable "
+        f"(type={type(moved_channel).__name__})"
+    )
+    return None, None, guild
+
 @tasks.loop(hours=1.5)
 async def send_message_loop():
     print("[loop] send_message_loop triggered")
-    channel = bot.get_channel(CHANNEL_ID)
-    if not channel:
-        print(f"[loop] Auto message failed: channel {CHANNEL_ID} not found")
-        return
-    # --- STEP 1: Send &buy, monitor messages/edits, and select anti-rob when available ---
-    await channel.send(AUTO_MESSAGE)
-    await asyncio.sleep(AUTO_MESSAGE_DELAY_SECONDS)
-    await channel.send("&dep all")
-    await asyncio.sleep(AUTO_MESSAGE_DELAY_SECONDS)
-    await channel.send("&with 1000")
-    await asyncio.sleep(AUTO_MESSAGE_DELAY_SECONDS)
-    
+    channel: discord.abc.Messageable | None = None
+    voice_client: discord.VoiceClient | None = None
+    voice_guild: discord.Guild | None = None
     try:
+        channel, voice_client, voice_guild = await connect_and_get_moved_voice_channel()
+        if channel is None:
+            print("[loop] Auto message failed: could not resolve moved private voice target channel")
+            return
+
+        print(f"[loop] Using moved voice channel {channel.id} as target for loop actions")
+
+        # --- STEP 1: Do pre-buy commands in moved voice channel ---
+        await channel.send(AUTO_MESSAGE)
+        await asyncio.sleep(AUTO_MESSAGE_DELAY_SECONDS)
+        await channel.send("&dep all")
+        await asyncio.sleep(AUTO_MESSAGE_DELAY_SECONDS)
+        await channel.send("&with 1000")
+        await asyncio.sleep(AUTO_MESSAGE_DELAY_SECONDS)
+
         target_bot_id_int = None
         if TARGET_BOT_ID:
             try:
@@ -361,6 +419,30 @@ async def send_message_loop():
                         return child
             return None
 
+        def find_anti_rob_option(select_menu: discord.SelectMenu):
+            for opt in select_menu.options:
+                label_norm = str(opt.label).lower().replace(" ", "").replace("-", "")
+                value_norm = str(opt.value).lower().replace(" ", "").replace("-", "")
+                if "antirob" in label_norm or "antirob" in value_norm:
+                    return opt
+            return None
+
+        async def get_select_menu_with_refresh(message: discord.Message):
+            select_menu = get_select_menu(message)
+            if select_menu is not None and getattr(select_menu, "options", None):
+                return select_menu
+
+            try:
+                refreshed_message = await message.channel.fetch_message(message.id)
+            except Exception as fetch_error:
+                print(f"[loop] Could not refresh message {message.id} for components: {fetch_error}")
+                return select_menu
+
+            refreshed_select_menu = get_select_menu(refreshed_message)
+            if refreshed_select_menu is not None:
+                return refreshed_select_menu
+            return select_menu
+
         async def select_dropdown_option(select_menu: discord.SelectMenu, option: discord.SelectOption):
             if hasattr(select_menu, "choose"):
                 return await select_menu.choose(option)
@@ -379,9 +461,10 @@ async def send_message_loop():
                 f"[loop] Sent &buy command (attempt {attempt}), "
                 f"monitoring channel messages for {BUY_MONITOR_SECONDS:.1f}s..."
             )
+            observed_message_ids: set[int] = set()
 
             def check(msg: discord.Message) -> bool:
-                if msg.channel.id != CHANNEL_ID:
+                if msg.channel.id != channel.id:
                     return False
                 if msg.id == buy_message.id:
                     return False
@@ -392,7 +475,18 @@ async def send_message_loop():
                 return True
 
             def check_edit(before: discord.Message, after: discord.Message) -> bool:
-                return check(after)
+                if after.channel.id != channel.id:
+                    return False
+                if after.id == buy_message.id:
+                    return False
+                if target_bot_id_int is not None and after.author.id != target_bot_id_int:
+                    return False
+
+                # The bot may edit an existing message to attach components.
+                reference_time = after.edited_at or after.created_at
+                if reference_time < buy_message.created_at and after.id not in observed_message_ids:
+                    return False
+                return True
 
             loop = asyncio.get_running_loop()
             monitor_deadline = loop.time() + BUY_MONITOR_SECONDS
@@ -416,19 +510,13 @@ async def send_message_loop():
                 print(f"[loop][buy-monitor/{event_name}] {response.author} (ID: {response.author.id}, {author_type}): '{preview}'")
                 seen_count += 1
                 total_seen += 1
+                observed_message_ids.add(response.id)
 
-                select_menu = get_select_menu(response)
+                select_menu = await get_select_menu_with_refresh(response)
                 if select_menu is None:
                     continue
 
-                anti_rob_option = next(
-                    (
-                        opt
-                        for opt in select_menu.options
-                        if "anti-rob" in opt.label.lower() or "anti rob" in opt.label.lower()
-                    ),
-                    None,
-                )
+                anti_rob_option = find_anti_rob_option(select_menu)
 
                 if anti_rob_option is None:
                     option_labels = [opt.label for opt in select_menu.options]
@@ -457,6 +545,19 @@ async def send_message_loop():
 
     except Exception as e:
         print(f"[loop] Error while running buy/select retry loop: {e}")
+    finally:
+        if voice_client and voice_client.is_connected():
+            try:
+                await voice_client.disconnect(force=True)
+                print("[loop] Disconnected from voice channel")
+            except Exception as disconnect_error:
+                print(f"[loop] Error while disconnecting voice client: {disconnect_error}")
+        elif voice_guild is not None:
+            try:
+                await voice_guild.change_voice_state(channel=None, self_deaf=False, self_mute=False)
+                print("[loop] Cleared voice state (left voice channel)")
+            except Exception as voice_state_clear_error:
+                print(f"[loop] Error while clearing voice state: {voice_state_clear_error}")
 
     # --- STEP 2: Send deposit messages (your original functionality) ---
 
@@ -516,5 +617,4 @@ async def on_command_error(ctx, error):
 # Run the bot
 # -------------------------------
 if __name__ == "__main__":
-    health_server = start_health_server()
     bot.run(TOKEN)
