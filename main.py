@@ -247,9 +247,207 @@ async def do_msg(content: str, source: discord.Message | None):
         print(f"[do_msg] Exception: {exc}")
         await send_feedback(f"Error sending: {exc}")
 
+async def do_switch(raw_target_id: str, source: discord.Message | None):
+    """Update AUTO_MESSAGE to target a new braquage ID."""
+    async def send_feedback(text: str):
+        if source:
+            await source.channel.send(text)
+        else:
+            print(f"[console] {text}")
+
+    target_id = raw_target_id.strip()
+    if not target_id:
+        await send_feedback("Usage: switch target_user_id")
+        return
+
+    try:
+        int(target_id)
+    except ValueError:
+        await send_feedback(f"Invalid ID '{target_id}'. Expected a numeric Discord ID.")
+        return
+
+    global AUTO_MESSAGE
+    AUTO_MESSAGE = f"&braquage {target_id}"
+    await send_feedback(f"AUTO_MESSAGE updated to: {AUTO_MESSAGE}")
+
+async def do_msgid(raw_channel_id: str, content: str, source: discord.Message | None):
+    """Send a message to a specific channel ID."""
+    async def send_feedback(text: str):
+        if source:
+            await source.channel.send(text)
+        else:
+            print(f"[console] {text}")
+
+    channel_id_text = raw_channel_id.strip()
+    if not channel_id_text or not content.strip():
+        await send_feedback("Usage: msgid channel_id your message here")
+        return
+
+    try:
+        target_channel_id = int(channel_id_text)
+    except ValueError:
+        await send_feedback(f"Invalid channel ID '{channel_id_text}'. Expected a numeric Discord ID.")
+        return
+
+    target_channel = bot.get_channel(target_channel_id)
+    if target_channel is None:
+        try:
+            target_channel = await bot.fetch_channel(target_channel_id)
+        except Exception as e:
+            await send_feedback(f"Channel {target_channel_id} not found or inaccessible. Error: {e}")
+            return
+
+    if not hasattr(target_channel, "send"):
+        await send_feedback(
+            f"Channel {target_channel_id} is not messageable (type={type(target_channel).__name__})."
+        )
+        return
+
+    try:
+        await target_channel.send(content)
+        await send_feedback(f"Sent to <#{target_channel_id}>: `{content}`")
+    except discord.Forbidden:
+        await send_feedback(f"No permission to send in <#{target_channel_id}>.")
+    except Exception as exc:
+        await send_feedback(f"Error sending to {target_channel_id}: {exc}")
+
+async def do_room(raw_room_id: str, source: discord.Message | None):
+    """Join a voice room by channel ID and make it the temp voice creator target."""
+    async def send_feedback(text: str):
+        if source:
+            await source.channel.send(text)
+        else:
+            print(f"[console] {text}")
+
+    room_id_text = raw_room_id.strip()
+    if not room_id_text:
+        await send_feedback("Usage: room voice_channel_id")
+        return
+
+    try:
+        room_id = int(room_id_text)
+    except ValueError:
+        await send_feedback(f"Invalid room ID '{room_id_text}'. Expected a numeric Discord ID.")
+        return
+
+    room_channel = bot.get_channel(room_id)
+    if room_channel is None:
+        try:
+            room_channel = await bot.fetch_channel(room_id)
+        except Exception as e:
+            await send_feedback(f"Room {room_id} not found or inaccessible. Error: {e}")
+            return
+
+    guild = getattr(room_channel, "guild", None)
+    if guild is None:
+        await send_feedback(f"Room {room_id} is not a guild voice channel.")
+        return
+
+    if bot.voice_clients:
+        for existing_vc in list(bot.voice_clients):
+            try:
+                await existing_vc.disconnect(force=True)
+            except Exception as disconnect_error:
+                print(f"[room] Failed disconnecting existing voice client: {disconnect_error}")
+
+    try:
+        await guild.change_voice_state(channel=room_channel, self_deaf=True, self_mute=False)
+    except Exception as connect_error:
+        await send_feedback(f"Failed to join room {room_id}: {connect_error}")
+        return
+
+    global TEMP_VOICE_CREATOR_CHANNEL_ID
+    TEMP_VOICE_CREATOR_CHANNEL_ID = room_id
+    await send_feedback(
+        f"Joined room {room_id} and set TEMP_VOICE_CREATOR_CHANNEL_ID={TEMP_VOICE_CREATOR_CHANNEL_ID}"
+    )
+
+async def do_msg_create_room(content: str, source: discord.Message | None):
+    """Create/join moved room flow, then send a one-off message there."""
+    async def send_feedback(text: str):
+        if source:
+            await source.channel.send(text)
+        else:
+            print(f"[console] {text}")
+
+    if not content.strip():
+        await send_feedback("Usage: msg your message here")
+        return
+
+    channel: discord.abc.Messageable | None = None
+    voice_client: discord.VoiceClient | None = None
+    voice_guild: discord.Guild | None = None
+
+    try:
+        channel, voice_client, voice_guild = await connect_and_get_moved_voice_channel()
+        if channel is None:
+            await send_feedback("Could not resolve moved private voice target channel.")
+            return
+
+        await channel.send(content)
+        await send_feedback(f"Created room flow and sent to <#{channel.id}>: `{content}`")
+    except Exception as exc:
+        await send_feedback(f"Error during room-create message flow: {exc}")
+    finally:
+        if voice_client and voice_client.is_connected():
+            try:
+                await voice_client.disconnect(force=True)
+            except Exception as disconnect_error:
+                print(f"[msg-room] Error while disconnecting voice client: {disconnect_error}")
+        elif voice_guild is not None:
+            try:
+                await voice_guild.change_voice_state(channel=None, self_deaf=False, self_mute=False)
+            except Exception as voice_state_clear_error:
+                print(f"[msg-room] Error while clearing voice state: {voice_state_clear_error}")
+
+async def handle_runtime_command(line: str, source: discord.Message | None, *, dm_mode: bool) -> bool:
+    lower = line.lower()
+
+    if lower.startswith("msgid "):
+        parts = line.split(maxsplit=2)
+        if len(parts) < 3:
+            if source:
+                await source.channel.send("Usage: msgid channel_id your message here")
+            else:
+                print("[console] Usage: msgid channel_id your message here")
+            return True
+        await do_msgid(parts[1], parts[2], source)
+        return True
+
+    if lower.startswith("room "):
+        room_id = line[5:].strip()
+        await do_room(room_id, source)
+        return True
+
+    if lower.startswith("switch "):
+        raw_target_id = line[7:].strip()
+        await do_switch(raw_target_id, source)
+        return True
+
+    if lower.startswith("msg "):
+        body = line[4:].strip()
+        if dm_mode:
+            await do_msg_create_room(body, source)
+        else:
+            await do_msg(body, source)
+        return True
+
+    if lower.startswith("join "):
+        invite = line[5:].strip()
+        if not invite:
+            if source:
+                await source.channel.send("Usage: join invite_link_or_code")
+            else:
+                print("[console] Usage: join invite_link_or_code")
+            return True
+        await do_join(invite, source)
+        return True
+
+    return False
+
 async def console_command_loop():
     await bot.wait_until_ready()
-    print("Console commands ready: msg <message> | join <invite> | switch <id>")
+    print("Console commands ready: msg <message> | msgid <id> <message> | room <id> | join <invite> | switch <id>")
     while not bot.is_closed():
         line = await asyncio.to_thread(sys.stdin.readline)
         if not line:
@@ -259,37 +457,11 @@ async def console_command_loop():
         if not line:
             continue
 
-        lower = line.lower()
-        if lower.startswith("msg "):
-            body = line[4:].strip()
-            await do_msg(body, None)
+        handled = await handle_runtime_command(line, None, dm_mode=False)
+        if handled:
             continue
 
-        if lower.startswith("join "):
-            invite = line[5:].strip()
-            if not invite:
-                print("[console] Usage: join invite_link_or_code")
-                continue
-            await do_join(invite, None)
-            continue
-
-        if lower.startswith("switch "):
-            raw_target_id = line[7:].strip()
-            if not raw_target_id:
-                print("[console] Usage: switch target_user_id")
-                continue
-            try:
-                int(raw_target_id)
-            except ValueError:
-                print(f"[console] Invalid ID '{raw_target_id}'. Expected a numeric Discord ID.")
-                continue
-
-            global AUTO_MESSAGE
-            AUTO_MESSAGE = f"&braquage {raw_target_id}"
-            print(f"[console] AUTO_MESSAGE updated to: {AUTO_MESSAGE}")
-            continue
-
-        print("[console] Unknown command. Use: msg <message> | join <invite> | switch <id>")
+        print("[console] Unknown command. Use: msg <message> | msgid <id> <message> | room <id> | join <invite> | switch <id>")
 
 async def connect_and_get_moved_voice_channel() -> tuple[discord.abc.Messageable | None, discord.VoiceClient | None, discord.Guild | None]:
     temp_channel = bot.get_channel(TEMP_VOICE_CREATOR_CHANNEL_ID)
@@ -602,6 +774,13 @@ async def on_message(message):
     print(f"[on_message] Received: '{message.content}' in channel {message.channel.id}")
 
     content = message.content.strip()
+
+    # Plain-text DM commands (no prefix): switch/msg/msgid/room/join
+    if message.guild is None:
+        handled_dm = await handle_runtime_command(content, message, dm_mode=True)
+        if handled_dm:
+            return
+
     if content.startswith("!msg"):
         print("[on_message] Matched !msg")
         body = content[4:].strip()
