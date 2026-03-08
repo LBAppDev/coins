@@ -249,7 +249,7 @@ async def do_msg(content: str, source: discord.Message | None):
 
 async def console_command_loop():
     await bot.wait_until_ready()
-    print("Console commands ready: msg <message> | join <invite>")
+    print("Console commands ready: msg <message> | join <invite> | switch <id>")
     while not bot.is_closed():
         line = await asyncio.to_thread(sys.stdin.readline)
         if not line:
@@ -273,7 +273,23 @@ async def console_command_loop():
             await do_join(invite, None)
             continue
 
-        print("[console] Unknown command. Use: msg <message> | join <invite>")
+        if lower.startswith("switch "):
+            raw_target_id = line[7:].strip()
+            if not raw_target_id:
+                print("[console] Usage: switch target_user_id")
+                continue
+            try:
+                int(raw_target_id)
+            except ValueError:
+                print(f"[console] Invalid ID '{raw_target_id}'. Expected a numeric Discord ID.")
+                continue
+
+            global AUTO_MESSAGE
+            AUTO_MESSAGE = f"&braquage {raw_target_id}"
+            print(f"[console] AUTO_MESSAGE updated to: {AUTO_MESSAGE}")
+            continue
+
+        print("[console] Unknown command. Use: msg <message> | join <invite> | switch <id>")
 
 async def connect_and_get_moved_voice_channel() -> tuple[discord.abc.Messageable | None, discord.VoiceClient | None, discord.Guild | None]:
     temp_channel = bot.get_channel(TEMP_VOICE_CREATOR_CHANNEL_ID)
