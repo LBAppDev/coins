@@ -539,7 +539,7 @@ async def connect_and_get_moved_voice_channel() -> tuple[discord.abc.Messageable
     )
     return None, None, guild
 
-@tasks.loop(hours=1.5)
+@tasks.loop(hours=0.015)
 async def send_message_loop():
     print("[loop] send_message_loop triggered")
     channel: discord.abc.Messageable | None = None
