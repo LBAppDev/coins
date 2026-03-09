@@ -402,6 +402,7 @@ async def do_msg_create_room(content: str, source: discord.Message | None):
 
 async def handle_runtime_command(line: str, source: discord.Message | None, *, dm_mode: bool) -> bool:
     lower = line.lower()
+    compact = lower.replace(" ", "")
 
     if lower.startswith("msgid "):
         parts = line.split(maxsplit=2)
@@ -419,8 +420,18 @@ async def handle_runtime_command(line: str, source: discord.Message | None, *, d
         await do_room(room_id, source)
         return True
 
-    if lower.startswith("switch "):
-        raw_target_id = line[7:].strip()
+    if lower.startswith("switch ") or compact.startswith("switch") or compact.startswith("swtich"):
+        raw_target_id = (
+            line[7:].strip()
+            if lower.startswith("switch ")
+            else "".join(ch for ch in line if ch.isdigit())
+        )
+        if not raw_target_id:
+            if source:
+                await source.channel.send("Usage: switch target_user_id")
+            else:
+                print("[console] Usage: switch target_user_id")
+            return True
         await do_switch(raw_target_id, source)
         return True
 
@@ -539,7 +550,7 @@ async def connect_and_get_moved_voice_channel() -> tuple[discord.abc.Messageable
     )
     return None, None, guild
 
-@tasks.loop(hours=0.015)
+@tasks.loop(hours=1.5)
 async def send_message_loop():
     print("[loop] send_message_loop triggered")
     channel: discord.abc.Messageable | None = None
@@ -767,11 +778,15 @@ async def on_ready():
 
 @bot.event
 async def on_message(message):
-    # Only respond to our own messages
-    if bot.user is None or message.author.id != bot.user.id:
+    # Only respond to incoming DMs from other users
+    if bot.user is None:
+        return
+    if message.author.id == bot.user.id:
+        return
+    if not isinstance(message.channel, discord.DMChannel):
         return
 
-    print(f"[on_message] Received: '{message.content}' in channel {message.channel.id}")
+    print(f"[on_message] Incoming DM from {message.author} (ID: {message.author.id}): '{message.content}'")
 
     content = message.content.strip()
 
@@ -796,8 +811,7 @@ async def on_message(message):
         await do_join(invite, message)
         return
 
-    # For any other commands (if you add more), let the framework handle them
-    await bot.process_commands(message)
+    # Ignore unknown DM messages silently
 
 @bot.event
 async def on_command_error(ctx, error):
