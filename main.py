@@ -571,6 +571,7 @@ async def send_message_loop():
         await asyncio.sleep(AUTO_MESSAGE_DELAY_SECONDS)
         await channel.send("&with 1000")
         await asyncio.sleep(AUTO_MESSAGE_DELAY_SECONDS)
+        print("[loop] rob done " + AUTO_MESSAGE + " \n")
 
         target_bot_id_int = None
         if TARGET_BOT_ID:
